@@ -1,0 +1,172 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#111">
+<title>Contador de Padrões</title>
+<style>
+  :root{--bg:#111;--panel:#1c1c1e;--fg:#f2f2f2;--mut:#9a9a9f;--ac:#2ecc40}
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--fg);font:16px system-ui,sans-serif;display:flex;flex-direction:column;min-height:100dvh}
+  header{display:flex;justify-content:space-between;align-items:center;padding:10px 16px}
+  header h1{font-size:16px;margin:0;font-weight:600}
+  #count{font-size:28px;font-weight:700;color:var(--ac)}
+  #stage{position:relative;width:100%;background:#000}
+  canvas{width:100%;height:auto;display:block;touch-action:manipulation}
+  #msg{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;text-align:center;padding:24px;color:var(--mut)}
+  .bar{display:flex;gap:8px;padding:12px 16px;flex-wrap:wrap}
+  button,label.btn{flex:1;min-width:100px;padding:14px;border:0;border-radius:12px;background:var(--panel);color:var(--fg);font-size:15px;text-align:center;cursor:pointer}
+  button.primary{background:var(--ac);color:#000;font-weight:700}
+  .ctl{padding:4px 16px;display:grid;grid-template-columns:110px 1fr 36px;align-items:center;gap:8px;color:var(--mut);font-size:14px}
+  .ctl input{width:100%}
+  small{display:block;padding:8px 16px 24px;color:var(--mut)}
+</style>
+</head>
+<body>
+<header><h1>Contador de Padrões</h1><div>Total: <span id="count">0</span></div></header>
+
+<div id="stage">
+  <canvas id="cv"></canvas>
+  <video id="vid" playsinline muted hidden></video>
+  <div id="msg">Carregando visão computacional…</div>
+</div>
+
+<div class="bar">
+  <button id="btnCam">📷 Abrir câmera</button>
+  <button id="btnFreeze" class="primary" disabled>Congelar</button>
+  <label class="btn">🖼 Foto<input id="file" type="file" accept="image/*" hidden></label>
+</div>
+
+<div class="ctl"><span>Tamanho mín.</span><input id="rmin" type="range" min="1" max="20" step="0.5" value="2.5"><span id="vmin"></span></div>
+<div class="ctl"><span>Tamanho máx.</span><input id="rmax" type="range" min="2" max="30" step="0.5" value="9"><span id="vmax"></span></div>
+<div class="ctl"><span>Sensibilidade</span><input id="sens" type="range" min="10" max="70" step="1" value="32"><span id="vsens"></span></div>
+
+<small>Ajuste o tamanho mín./máx. (% da largura da imagem) até os círculos ficarem certos. Com a imagem congelada, toque em um círculo para removê-lo ou em um espaço vazio para adicionar.</small>
+
+<script async src="opencv.js" onload="cvLoaded()"></script>
+<script>
+const $ = id => document.getElementById(id);
+const cv_ = $('cv'), ctx = cv_.getContext('2d', {willReadFrequently:true});
+const vid = $('vid'), msg = $('msg');
+const frame = document.createElement('canvas'); // imagem atual (sem overlay)
+const fctx = frame.getContext('2d', {willReadFrequently:true});
+const PROC_W = 720;
+let circles = [], frozen = false, camOn = false, cvReady = false, lastDetect = 0, hasImage = false;
+
+function cvLoaded(){
+  cv['onRuntimeInitialized'] = () => { cvReady = true; msg.textContent = 'Abra a câmera ou escolha uma foto.'; };
+  if (cv.Mat) { cvReady = true; msg.textContent = 'Abra a câmera ou escolha uma foto.'; }
+}
+
+for (const [id,v,suf] of [['rmin','vmin','%'],['rmax','vmax','%'],['sens','vsens','']]) {
+  const upd = () => { $(v).textContent = $(id).value + suf; if (frozen && hasImage) detect(); };
+  $(id).addEventListener('input', upd); $(v).textContent = $(id).value + suf;
+}
+
+$('btnCam').onclick = async () => {
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({video:{facingMode:{ideal:'environment'},width:{ideal:1280}},audio:false});
+    vid.srcObject = stream; await vid.play();
+    camOn = true; frozen = false; hasImage = false; msg.style.display = 'none';
+    $('btnFreeze').disabled = false; $('btnFreeze').textContent = 'Congelar';
+    $('btnCam').textContent = '📷 Câmera ligada';
+  } catch (e) {
+    msg.style.display = 'flex';
+    msg.textContent = 'Não foi possível abrir a câmera (' + e.name + '). É necessário HTTPS e permissão de câmera.';
+  }
+};
+
+$('btnFreeze').onclick = () => {
+  frozen = !frozen;
+  $('btnFreeze').textContent = frozen ? 'Retomar' : 'Congelar';
+  if (frozen) detect();
+};
+
+$('file').onchange = e => {
+  const f = e.target.files[0]; if (!f) return;
+  const img = new Image();
+  img.onload = () => {
+    setFrame(img, img.naturalWidth, img.naturalHeight);
+    frozen = true; hasImage = true; msg.style.display = 'none';
+    $('btnFreeze').disabled = false; $('btnFreeze').textContent = 'Retomar';
+    detect(); URL.revokeObjectURL(img.src);
+  };
+  img.src = URL.createObjectURL(f);
+};
+
+function setFrame(src, w, h){
+  const s = Math.min(1, PROC_W / w);
+  frame.width = cv_.width = Math.round(w * s);
+  frame.height = cv_.height = Math.round(h * s);
+  fctx.drawImage(src, 0, 0, frame.width, frame.height);
+}
+
+function detect(){
+  if (!cvReady || !frame.width) return;
+  const W = frame.width;
+  const minR = Math.max(3, Math.round(W * $('rmin').value / 100));
+  const maxR = Math.max(minR + 2, Math.round(W * $('rmax').value / 100));
+  const p2 = +$('sens').value;
+  const src = cv.imread(frame), gray = new cv.Mat(), out = new cv.Mat();
+  try {
+    cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);
+    cv.medianBlur(gray, gray, 5);
+    cv.HoughCircles(gray, out, cv.HOUGH_GRADIENT, 1, Math.max(minR * 1.5, 8), 100, p2, minR, maxR);
+    const res = [];
+    for (let i = 0; i < out.cols; i++) res.push({x: out.data32F[i*3], y: out.data32F[i*3+1], r: out.data32F[i*3+2]});
+    // objetos repetidos têm tamanho parecido: descarta outliers e círculos sobrepostos
+    if (res.length > 5) {
+      const rs = res.map(c => c.r).sort((a,b) => a - b), med = rs[rs.length >> 1];
+      let keep = res.filter(c => c.r > med * 0.65 && c.r < med * 1.5);
+      keep.sort((a,b) => b.r - a.r);
+      const ok = [];
+      for (const c of keep) if (ok.every(o => Math.hypot(o.x - c.x, o.y - c.y) > (o.r + c.r) * 0.75)) ok.push(c);
+      res.length = 0; res.push(...ok);
+    }
+    // ordena de cima para baixo, esquerda para direita (numeração estável)
+    const rowH = minR * 2;
+    res.sort((a,b) => Math.round(a.y/rowH) - Math.round(b.y/rowH) || a.x - b.x);
+    circles = res;
+  } finally { src.delete(); gray.delete(); out.delete(); }
+}
+
+function render(){
+  if (!frozen && camOn && vid.videoWidth) {
+    if (!frame.width || frame.width !== Math.min(vid.videoWidth, PROC_W)) setFrame(vid, vid.videoWidth, vid.videoHeight);
+    else fctx.drawImage(vid, 0, 0, frame.width, frame.height);
+    const now = performance.now();
+    if (now - lastDetect > 350) { lastDetect = now; detect(); }
+  }
+  if (frame.width) {
+    ctx.drawImage(frame, 0, 0);
+    const fs = Math.max(11, frame.width * 0.028);
+    ctx.font = `bold ${fs}px system-ui`; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    circles.forEach((c, i) => {
+      ctx.lineWidth = Math.max(2, frame.width * 0.004); ctx.strokeStyle = '#2ecc40';
+      ctx.beginPath(); ctx.arc(c.x, c.y, c.r, 0, 7); ctx.stroke();
+      const t = String(i + 1);
+      ctx.lineWidth = 3; ctx.strokeStyle = '#000'; ctx.strokeText(t, c.x, c.y);
+      ctx.fillStyle = '#ff3b30'; ctx.fillText(t, c.x, c.y);
+    });
+  }
+  $('count').textContent = circles.length;
+  requestAnimationFrame(render);
+}
+render();
+
+// edição manual com a imagem congelada
+cv_.addEventListener('click', e => {
+  if (!frozen) return;
+  const b = cv_.getBoundingClientRect(), k = cv_.width / b.width;
+  const x = (e.clientX - b.left) * k, y = (e.clientY - b.top) * k;
+  const idx = circles.findIndex(c => Math.hypot(c.x - x, c.y - y) <= c.r);
+  if (idx >= 0) circles.splice(idx, 1);
+  else {
+    const r = circles.length ? circles.reduce((s,c) => s + c.r, 0) / circles.length : frame.width * 0.05;
+    circles.push({x, y, r});
+  }
+});
+</script>
+</body>
+</html>
